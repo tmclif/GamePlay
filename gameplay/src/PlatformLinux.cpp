@@ -30,6 +30,7 @@ static Window   __window;
 static int __windowSize[2];
 static GLXContext __context;
 static Window __attachToWindow;
+static Atom __atomWmDeleteWindow;
 
 namespace gameplay
 {
@@ -381,6 +382,39 @@ Platform* Platform::create(Game* game, void* attachToWindow)
     FileSystem::setResourcePath("./");
     Platform* platform = new Platform(game);
 
+    // Get window configuration
+
+    // Default values
+    const char *title = NULL;
+    int __x = 0, __y = 0, __width = 1280, __height = 800;
+    bool fullscreen = false;
+    if (game->getConfig())
+    {
+        Properties* config = game->getConfig()->getNamespace("window", true);
+        if (config)
+        {
+            // Read window title.
+            title = config->getString("title");
+
+            // Read window rect.
+            int x = config->getInt("x");
+            if (x != 0) __x = x;
+
+            int y = config->getInt("y");
+            if (y != 0) __y = y;
+            
+            int width = config->getInt("width");
+            if (width != 0) __width = width;
+
+            int height = config->getInt("height");
+            if (height != 0) __height = height;
+
+            fullscreen = config->getBool("fullscreen");
+
+
+        }
+    }
+
     // Get the display and initialize.
     __display = XOpenDisplay(NULL);
     if (__display == NULL)
@@ -450,12 +484,37 @@ Platform* Platform::create(Game* game, void* attachToWindow)
     GLint winMask;
     winMask = CWBorderPixel | CWBitGravity | CWEventMask| CWColormap;
    
-    __window = XCreateWindow(__display, DefaultRootWindow(__display), 0, 0, 1280, 720, 0, 
+    __window = XCreateWindow(__display, DefaultRootWindow(__display), __x, __y, __width, __height, 0, 
                             visualInfo->depth, InputOutput, visualInfo->visual, winMask,
                             &winAttribs); 
-    
+
+    // Tell the window manager that it should send the delete window notification through ClientMessage
+    __atomWmDeleteWindow = XInternAtom(__display, "WM_DELETE_WINDOW", False);
+    XSetWMProtocols(__display, __window, &__atomWmDeleteWindow, 1);
+
     XMapWindow(__display, __window);
-    XStoreName(__display, __window, "");
+
+    // Send fullscreen atom message to the window; most window managers respect WM_STATE messages
+    // Note: fullscreen mode will use native desktop resolution and won't care about width/height specified
+    if (fullscreen)
+    {
+        XEvent xev;
+        Atom atomWm_state = XInternAtom(__display, "_NET_WM_STATE", False);
+        Atom atomFullscreen = XInternAtom(__display, "_NET_WM_STATE_FULLSCREEN", False);
+
+        memset(&xev, 0, sizeof(xev));
+        xev.type = ClientMessage;
+        xev.xclient.window = __window;
+        xev.xclient.message_type = atomWm_state;
+        xev.xclient.format = 32;
+        xev.xclient.data.l[0] = 1;
+        xev.xclient.data.l[1] = atomFullscreen;
+        xev.xclient.data.l[2] = 0;
+
+        XSendEvent(__display, DefaultRootWindow(__display), false, SubstructureNotifyMask | SubstructureRedirectMask, &xev);
+    }
+    
+    XStoreName(__display, __window, title ? title : "");
 
     __context = glXCreateContext(__display, visualInfo, NULL, True);
     if(!__context)
@@ -550,15 +609,23 @@ int Platform::enterMessagePump()
     // Message loop.
     while (true)
     {
-        int ret = poll( xpolls, 1, 16 );
-
+        poll( xpolls, 1, 16 );
         // handle all pending events in one block 
-        while (ret && XPending(__display))
+        while (XPending(__display))    
         {
            XNextEvent(__display, &evt);
         
             switch (evt.type) 
             {
+            case ClientMessage:
+                {
+                    // Handle destroy window message correctly
+                    if (evt.xclient.data.l[0] == __atomWmDeleteWindow)
+                    {
+                        _game->exit();
+                    }
+                }
+                break;
             case DestroyNotify :
                 {
                     cleanupX11();
@@ -688,7 +755,13 @@ int Platform::enterMessagePump()
         }
 
         if (_game)
+        {
+            // Game state will be uninitialized if game was closed through Game::exit()
+            if (_game->getState() == Game::UNINITIALIZED)
+                break;            
+            
             _game->frame();
+        }
 
         glXSwapBuffers(__display, __window);
     }
